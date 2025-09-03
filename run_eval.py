@@ -50,7 +50,6 @@ except Exception as e:
 FUZZY_EM_RATIO = 0.92  # SequenceMatcher ratio threshold for fuzzy EM (conservative)
 DEFAULT_BATCH_SIZE = 4
 DEFAULT_DTYPE = "half"
-VLLM_BATCH_GENERATE_MAX_RETRIES = 1  # fallback to single-call per-example if batched generation fails
 
 # ---------------- Normalization & scoring utilities ----------------
 def normalize_answer(s: Optional[str]) -> str:
@@ -307,19 +306,18 @@ def extract_fields_for_dataset(example: dict, dataset: str) -> Tuple[Optional[st
 # ---------------- vllm helpers ----------------
 def get_text_from_vllm_result(pred_obj) -> str:
     """Safely extract text from a vllm result item."""
-    # vllm generate returns objects with .outputs; each output is a list of result alternatives with .text
     try:
-        # some returns have outputs property
+        # vllm generate returns objects with .outputs; each output is a list of result alternatives with .text
         if hasattr(pred_obj, "outputs"):
             out0 = pred_obj.outputs[0]
             if hasattr(out0, "text"):
-                return out0.text
-            return str(out0)
+                return out0.text.strip()
+            return str(out0).strip()
         # fallback
-        return str(pred_obj)
+        return str(pred_obj).strip()
     except Exception:
         try:
-            return str(pred_obj)
+            return str(pred_obj).strip()
         except Exception:
             return ""
 
@@ -336,17 +334,17 @@ def batched_generate(model: LLM, prompts: List[str], sampling_params: SamplingPa
         # model.generate returns a list-like object; extract text for each
         texts = []
         for p in preds:
-            texts.append(get_text_from_vllm_result(p).strip())
+            texts.append(get_text_from_vllm_result(p))
         return texts
     except Exception as e:
-        print("vllm batched generation failed (will fallback to single-call loop). Error:", e)
+        print("vllm batched generation failed (will fallback to single-call loop). Error:", e, file=sys.stderr)
         texts = []
         for p in prompts:
             try:
                 single = model.generate([p], sampling_params)[0]
-                texts.append(get_text_from_vllm_result(single).strip())
+                texts.append(get_text_from_vllm_result(single))
             except Exception as e2:
-                print("vllm single-call generation failed for one prompt:", e2)
+                print("vllm single-call generation failed for one prompt:", e2, file=sys.stderr)
                 texts.append("")
         return texts
 
@@ -366,28 +364,21 @@ def evaluate_fever(ds, model, sampling_params, out_dir: Path, n_samples: int, ba
     # batch processing
     for i in range(0, len(indices), batch_size):
         batch_idxs = indices[i : i + batch_size]
-        prompts = []
-        meta_list = []
-        idx_list = []
+        actual_prompts = []
+        prompt_meta = []  # (idx, meta, instruction)
+
+        # build prompts for this batch
         for idx in batch_idxs:
             ex = data[int(idx)]
             instruction, answers, context, meta = extract_fields_for_dataset(ex, "mwong/fever-evidence-related")
             if instruction is None:
-                prompts.append(None)
-                meta_list.append((idx, None))
+                outputs.append({"index": idx, "skipped": True, "reason": "no-claim"})
                 continue
             prompt = format_prompt(f"Verify this claim: {instruction}\nAnswer with one of: SUPPORTED, REFUTED, NOT ENOUGH INFO.")
-            prompts.append(prompt)
-            meta_list.append((idx, meta))
-            idx_list.append(idx)
+            actual_prompts.append(prompt)
+            prompt_meta.append((idx, meta, instruction))
 
-        # Filter None prompts
-        actual_prompts = [p for p in prompts if p is not None]
         if not actual_prompts:
-            # write skipped entries
-            for (idx, m) in meta_list:
-                if m is None:
-                    outputs.append({"index": idx, "skipped": True, "reason": "no-claim"})
             continue
 
         t0 = time.perf_counter()
@@ -396,14 +387,7 @@ def evaluate_fever(ds, model, sampling_params, out_dir: Path, n_samples: int, ba
         per_latency = (t1 - t0) / max(1, len(actual_prompts))
         latencies.extend([per_latency] * len(actual_prompts))
 
-        # assign results back to meta_list order
-        j = 0
-        for (idx, meta) in meta_list:
-            if meta is None:
-                # skipped
-                continue
-            text = texts[j] if j < len(texts) else ""
-            j += 1
+        for (idx, meta, instruction), text in zip(prompt_meta, texts):
             label = meta.get("label") or meta.get("gold_label") or None
             mapped = map_to_fever_label(text)
             correct_flag = 0
@@ -416,6 +400,7 @@ def evaluate_fever(ds, model, sampling_params, out_dir: Path, n_samples: int, ba
                         correct_flag = 1
             outputs.append({
                 "index": idx,
+                "instruction": instruction,
                 "model_raw": text,
                 "pred_label": mapped,
                 "gold_label": label,
@@ -443,13 +428,13 @@ def map_to_fever_label(text: str) -> str:
     """Map arbitrary model output to one of SUPPORTED / REFUTED / NOT ENOUGH INFO (NEI)"""
     t = normalize_answer(text)
     # check for obvious tokens
-    if any(w in t for w in ["support", "supported", "yes", "true", "entails", "supported."]):
+    if any(w in t for w in ["support", "supported", "yes", "true", "entails"]):
         return "SUPPORTED"
-    if any(w in t for w in ["refute", "refuted", "false", "no", "contradict", "refuted."]):
+    if any(w in t for w in ["refute", "refuted", "false", "no", "contradict"]):
         return "REFUTED"
-    if any(w in t for w in ["not enough", "insufficient", "no evidence", "unknown", "cannot determine", "nei"]):
+    if any(w in t for w in ["not enough", "insufficient", "no evidence", "unknown", "cannot determine", "nei", "not enough info"]):
         return "NOT ENOUGH INFO"
-    # fallback to last token heuristics
+    # fallback heuristics
     if "supported" in t:
         return "SUPPORTED"
     if "refuted" in t or "refute" in t:
@@ -481,25 +466,19 @@ def evaluate_generic_qa(ds, model, sampling_params, out_dir: Path, n_samples: in
     # process in batches
     for i in range(0, len(indices), batch_size):
         batch_idxs = indices[i : i + batch_size]
-        prompts = []
-        metadata = []
+        actual_prompts = []
+        meta_list = []  # tuples (idx, answers, instruction)
+
         for idx in batch_idxs:
             ex = data[int(idx)]
             instruction, answers, context, meta = extract_fields_for_dataset(ex, dataset_name)
             if instruction is None:
-                prompts.append(None)
-                metadata.append((idx, None, None))
+                outputs.append({"index": idx, "skipped": True, "reason": "no-question"})
                 continue
-            prompts.append(format_prompt(instruction, paragraph=context))
-            metadata.append((idx, answers, instruction))
+            actual_prompts.append(format_prompt(instruction, paragraph=context))
+            meta_list.append((idx, answers, instruction))
 
-        # filter prompts
-        actual_prompts = [p for p in prompts if p is not None]
         if not actual_prompts:
-            # record skips
-            for (idx, a, ins) in metadata:
-                if a is None and ins is None:
-                    outputs.append({"index": idx, "skipped": True, "reason": "no-question"})
             continue
 
         t0 = time.perf_counter()
@@ -508,14 +487,7 @@ def evaluate_generic_qa(ds, model, sampling_params, out_dir: Path, n_samples: in
         per_latency = (t1 - t0) / max(1, len(actual_prompts))
         latencies.extend([per_latency] * len(actual_prompts))
 
-        # iterate through metadata and assign in order
-        j = 0
-        for (idx, answers, instruction) in metadata:
-            if instruction is None:
-                outputs.append({"index": idx, "skipped": True, "reason": "no-question"})
-                continue
-            text = texts[j] if j < len(texts) else ""
-            j += 1
+        for (idx, answers, instruction), text in zip(meta_list, texts):
             if metric_mode == "em_f1":
                 em, f1 = best_em_f1_over_golds(text, answers)
                 em_sum += em
@@ -584,25 +556,21 @@ def evaluate_ragtruth(ds, model, sampling_params, out_dir: Path, n_samples: int,
     # process batches
     for i in range(0, len(indices), batch_size):
         batch_idxs = indices[i : i + batch_size]
-        prompts = []
-        metas = []
+        actual_prompts = []
+        meta_list = []  # (idx, meta, instruction)
+
         for idx in batch_idxs:
             ex = data[int(idx)]
             instruction, answers, context, meta = extract_fields_for_dataset(ex, "wandb/RAGTruth-processed")
             if instruction is None and "query" in ex:
                 instruction = ex.get("query")
             if instruction is None:
-                prompts.append(None)
-                metas.append((idx, None, None))
+                outputs.append({"index": idx, "skipped": True, "reason": "no-query"})
                 continue
-            prompts.append(format_prompt(instruction, paragraph=context))
-            metas.append((idx, meta, instruction))
+            actual_prompts.append(format_prompt(instruction, paragraph=context))
+            meta_list.append((idx, meta, instruction))
 
-        actual_prompts = [p for p in prompts if p is not None]
         if not actual_prompts:
-            for (idx, meta, ins) in metas:
-                if ins is None:
-                    outputs.append({"index": idx, "skipped": True, "reason": "no-query"})
             continue
 
         t0 = time.perf_counter()
@@ -611,24 +579,17 @@ def evaluate_ragtruth(ds, model, sampling_params, out_dir: Path, n_samples: int,
         per_latency = (t1 - t0) / max(1, len(actual_prompts))
         latencies.extend([per_latency] * len(actual_prompts))
 
-        j = 0
-        for (idx, meta, instruction) in metas:
-            if instruction is None:
-                continue
-            text = texts[j] if j < len(texts) else ""
-            j += 1
-            gold_label = meta.get("ragtruth_label") if isinstance(meta, dict) else None
-            if gold_label is None:
-                # attempt to find label in other fields (best-effort)
-                # no guarantee - leave as None if not found
-                pass
+        for (idx, meta, instruction), text in zip(meta_list, texts):
+            gold_label = None
+            if isinstance(meta, dict):
+                gold_label = meta.get("ragtruth_label") or meta.get("gold_label") or meta.get("label")
             # convert gold to binary if possible
             gold_binary = None
             if isinstance(gold_label, str):
                 gl = gold_label.strip().lower()
                 if gl in ("yes", "true", "1", "hallucinated", "halluc"):
                     gold_binary = 1
-                elif gl in ("no", "false", "0", "not_hallucinated"):
+                elif gl in ("no", "false", "0", "not_hallucinated", "not enough", "none"):
                     gold_binary = 0
             elif isinstance(gold_label, (int, float, bool)):
                 gold_binary = int(bool(gold_label))
@@ -653,9 +614,9 @@ def evaluate_ragtruth(ds, model, sampling_params, out_dir: Path, n_samples: int,
                 "gold_label": gold_label,
                 "pred_halluc": pred_halluc,
                 "latency_s": per_latency,
-                "ragtruth_spans": meta.get("ragtruth_spans") if isinstance(meta, dict) else None
+                "ragtruth_spans": (meta.get("ragtruth_spans") if isinstance(meta, dict) else None)
             })
-            if meta.get("ragtruth_spans") if isinstance(meta, dict) else False:
+            if isinstance(meta, dict) and meta.get("ragtruth_spans"):
                 span_prf_accum.append(compute_span_level_prf(text, meta.get("ragtruth_spans")))
 
     evaled = len([o for o in outputs if not o.get("skipped", False)])
@@ -806,7 +767,7 @@ def main():
             if summ:
                 summary_list.append(summ)
         except Exception as e:
-            print(f"Failed to evaluate {ds_id}: {e}")
+            print(f"Failed to evaluate {ds_id}: {e}", file=sys.stderr)
 
     # Save overall summary
     summary_json = out_dir / "summary.json"
