@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-eval_selfrag_full.py
+run_eval.py
 
-Research-ready evaluation runner for SELF-RAG inference only.
+Research-ready evaluation runner for SELF-RAG inference only, aligned with the Self-RAG README (7B model).
 
 Usage:
-    python eval_selfrag_full.py \
+    python run_eval.py \
       --model_name selfrag/selfrag_llama2_7b \
       --n_samples 200 \
       --max_new_tokens 512 \
@@ -14,15 +14,14 @@ Usage:
 Notes:
  - Requires: vllm, datasets, python-standard libs.
  - Log in to HuggingFace first if datasets require auth (`huggingface-cli login`).
- - For RAGTruth span-level metrics, the script attempts to find span annotations in the dataset fields;
-   if they are absent it will compute only response-level detection metrics.
+ - For RAGTruth span-level metrics, this script currently does not compute span-level PRF (left as None).
  - EM is improved to account for surface wording differences using normalization, containment, and fuzzy ratio.
+ - Follows the Self-RAG README formatting and defaults for vLLM: dtype default is "half" and skip_special_tokens=False.
 """
 
 import argparse
 import csv
 import json
-import math
 import os
 import random
 import re
@@ -49,6 +48,7 @@ except Exception as e:
 # ---------------- Constants & thresholds ----------------
 FUZZY_EM_RATIO = 0.92  # SequenceMatcher ratio threshold for fuzzy EM (conservative)
 DEFAULT_BATCH_SIZE = 4
+# Keep 'half' as the default to follow README, but coerce internally to a valid vLLM dtype.
 DEFAULT_DTYPE = "half"
 
 # ---------------- Normalization & scoring utilities ----------------
@@ -200,18 +200,14 @@ def extract_ragtruth_spans(example: dict) -> Optional[List[Tuple[int,int]]]:
                     pass
     return None
 
-def compute_span_level_prf(pred_text: str, gold_spans: List[Tuple[int,int]]) -> Tuple[float,float,float]:
+def compute_span_level_prf(pred_text: str, gold_spans: List[Tuple[int,int]]) -> Optional[Tuple[float,float,float]]:
     """
-    Given predicted text and gold hallucinated character spans (assumed relative to pred_text or original),
-    compute approximate span-level P/R/F1 by token overlap between predicted hallucinated tokens and gold spans.
-    This is best-effort — if gold spans are provided relative to source not prediction, accuracy may vary.
-    We'll convert character spans to token sets and compute overlap.
+    Placeholder for span-level PRF computation.
 
-    NOTE: real span-level evaluation requires alignment between gold spans and predicted text. This function is a placeholder
-    that returns 0s when we cannot reliably map spans.
+    Real span-level evaluation requires alignment between gold spans and prediction text.
+    This function currently returns None to indicate 'not computed'.
     """
-    # Placeholder implementation, returning zeros.
-    return 0.0, 0.0, 0.0
+    return None
 
 # ---------------- Dataset extraction heuristics ----------------
 def extract_fields_for_dataset(example: dict, dataset: str) -> Tuple[Optional[str], Optional[List[str]], Optional[str], dict]:
@@ -222,7 +218,7 @@ def extract_fields_for_dataset(example: dict, dataset: str) -> Tuple[Optional[st
     # Generic candidates
     q_candidates = ["question", "query", "claim", "instruction", "input", "query_text", "question_text", "question_body"]
     ans_candidates = ["answers", "answer", "gold_answers", "label", "answer_text", "target_text"]
-    context_candidates = ["contexts", "context", "retrieved_docs", "paragraph", "evidence", "document", "context_text", "passage", "context"]
+    context_candidates = ["contexts", "context", "retrieved_docs", "paragraph", "evidence", "document", "context_text", "passage"]
     meta = {}
     instruction = None
 
@@ -238,7 +234,6 @@ def extract_fields_for_dataset(example: dict, dataset: str) -> Tuple[Optional[st
             if "claim" in example:
                 instruction = example["claim"]
         if dataset.startswith("mandarjoshi/trivia_qa"):
-            # TriviaQA uses 'question' usually
             if "question" in example:
                 instruction = example["question"]
         if dataset.startswith("microsoft/ms_marco"):
@@ -374,7 +369,7 @@ def evaluate_fever(ds, model, sampling_params, out_dir: Path, n_samples: int, ba
             if instruction is None:
                 outputs.append({"index": idx, "skipped": True, "reason": "no-claim"})
                 continue
-            prompt = format_prompt(f"Verify this claim: {instruction}\nAnswer with one of: SUPPORTED, REFUTED, NOT ENOUGH INFO.")
+            prompt = format_prompt(f"Verify this claim: {instruction}\nAnswer with one of: SUPPORTS, REFUTES, NOT ENOUGH INFO.")
             actual_prompts.append(prompt)
             prompt_meta.append((idx, meta, instruction))
 
@@ -388,22 +383,18 @@ def evaluate_fever(ds, model, sampling_params, out_dir: Path, n_samples: int, ba
         latencies.extend([per_latency] * len(actual_prompts))
 
         for (idx, meta, instruction), text in zip(prompt_meta, texts):
-            label = meta.get("label") or meta.get("gold_label") or None
+            gold_label = meta.get("label") if isinstance(meta, dict) else None
             mapped = map_to_fever_label(text)
             correct_flag = 0
-            if label is not None:
-                if isinstance(label, str):
-                    if normalize_label_compare(mapped, label):
-                        correct_flag = 1
-                else:
-                    if normalize_label_compare(mapped, str(label)):
-                        correct_flag = 1
+            if gold_label is not None:
+                if normalize_label_compare(mapped, gold_label):
+                    correct_flag = 1
             outputs.append({
                 "index": idx,
                 "instruction": instruction,
                 "model_raw": text,
                 "pred_label": mapped,
-                "gold_label": label,
+                "gold_label": gold_label,
                 "correct": correct_flag,
                 "latency_s": per_latency
             })
@@ -425,26 +416,72 @@ def evaluate_fever(ds, model, sampling_params, out_dir: Path, n_samples: int, ba
     }
 
 def map_to_fever_label(text: str) -> str:
-    """Map arbitrary model output to one of SUPPORTED / REFUTED / NOT ENOUGH INFO (NEI)"""
+    """Map arbitrary model output to one of SUPPORTS / REFUTES / NOT ENOUGH INFO (NEI first; conservative, word-boundary based)."""
     t = normalize_answer(text)
-    # check for obvious tokens
-    if any(w in t for w in ["support", "supported", "yes", "true", "entails"]):
-        return "SUPPORTED"
-    if any(w in t for w in ["refute", "refuted", "false", "no", "contradict"]):
-        return "REFUTED"
-    if any(w in t for w in ["not enough", "insufficient", "no evidence", "unknown", "cannot determine", "nei", "not enough info"]):
+
+    # Handle explicit 'not support' forms as REFUTES early
+    if re.search(r"\b(not|no)\s+(support|supported|supports)\b", t):
+        return "REFUTES"
+
+    # NOT ENOUGH INFO (NEI) first
+    if (
+        "not enough" in t
+        or "insufficient" in t
+        or "no evidence" in t
+        or "unknown" in t
+        or "cannot determine" in t
+        or "unable to determine" in t
+        or "cannot tell" in t
+        or "indeterminate" in t
+        or re.search(r"\bnei\b", t) is not None
+    ):
         return "NOT ENOUGH INFO"
-    # fallback heuristics
-    if "supported" in t:
-        return "SUPPORTED"
-    if "refuted" in t or "refute" in t:
-        return "REFUTED"
+
+    # REFUTES
+    if (
+        re.search(r"\brefut\w*\b", t) is not None
+        or re.search(r"\bcontradict\w*\b", t) is not None
+        or re.search(r"\bdisprov\w*\b", t) is not None
+        or re.search(r"(?<!not\s)\bfalse\b", t) is not None
+        or re.search(r"\bdoes\s+not\s+(hold|follow)\b", t) is not None
+    ):
+        return "REFUTES"
+
+    # SUPPORTS
+    if (
+        re.search(r"(?<!not\s)\b(support|supports|supported|entail|entails|entailed)\b", t) is not None
+        or re.search(r"(?<!not\s)\b(true|yes)\b", t) is not None
+    ):
+        return "SUPPORTS"
+
+    # Default to NEI
     return "NOT ENOUGH INFO"
 
-def normalize_label_compare(pred_label: str, gold_label: str) -> bool:
+def normalize_label_compare(pred_label: Optional[str], gold_label: Optional[str]) -> bool:
     if pred_label is None or gold_label is None:
         return False
-    return normalize_answer(pred_label) == normalize_answer(str(gold_label))
+
+    def canonize(x: str) -> str:
+        x = normalize_answer(x)
+        # Map synonyms and variants to canonical set
+        mapping = {
+            "supported": "supports",
+            "support": "supports",
+            "entail": "supports",
+            "entails": "supports",
+            "entailed": "supports",
+            "refuted": "refutes",
+            "refute": "refutes",
+            "contradiction": "refutes",
+            "contradicts": "refutes",
+            "nei": "not enough info",
+        }
+        return mapping.get(x, x)
+
+    pl = canonize(pred_label)
+    gl = canonize(gold_label)
+    # Golds are commonly "SUPPORTS"/"REFUTES"/"NOT ENOUGH INFO"
+    return pl == gl
 
 def evaluate_generic_qa(ds, model, sampling_params, out_dir: Path, n_samples: int, batch_size: int, dataset_name: str, metric_mode: str):
     """
@@ -551,7 +588,7 @@ def evaluate_ragtruth(ds, model, sampling_params, out_dir: Path, n_samples: int,
     outputs = []
     tp = fp = fn = 0
     latencies = []
-    span_prf_accum = []
+    span_prf_accum: List[Tuple[float, float, float]] = []
 
     # process batches
     for i in range(0, len(indices), batch_size):
@@ -584,7 +621,7 @@ def evaluate_ragtruth(ds, model, sampling_params, out_dir: Path, n_samples: int,
             if isinstance(meta, dict):
                 gold_label = meta.get("ragtruth_label") or meta.get("gold_label") or meta.get("label")
             # convert gold to binary if possible
-            gold_binary = None
+            gold_binary: Optional[int] = None
             if isinstance(gold_label, str):
                 gl = gold_label.strip().lower()
                 if gl in ("yes", "true", "1", "hallucinated", "halluc"):
@@ -617,18 +654,27 @@ def evaluate_ragtruth(ds, model, sampling_params, out_dir: Path, n_samples: int,
                 "ragtruth_spans": (meta.get("ragtruth_spans") if isinstance(meta, dict) else None)
             })
             if isinstance(meta, dict) and meta.get("ragtruth_spans"):
-                span_prf_accum.append(compute_span_level_prf(text, meta.get("ragtruth_spans")))
+                prf = compute_span_level_prf(text, meta.get("ragtruth_spans"))
+                if prf is not None:
+                    span_prf_accum.append(prf)
 
     evaled = len([o for o in outputs if not o.get("skipped", False)])
     precision = tp / (tp + fp) if (tp + fp) else None
     recall = tp / (tp + fn) if (tp + fn) else None
-    f1 = (2 * precision * recall / (precision + recall)) if (precision and recall) else None
+    if precision is not None and recall is not None:
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    else:
+        f1 = None
+
     span_prf_avg = None
+    span_prf_computed = False
     if span_prf_accum:
         ps = [p for p, r, f in span_prf_accum]
         rs = [r for p, r, f in span_prf_accum]
         fs = [f for p, r, f in span_prf_accum]
         span_prf_avg = {"p": sum(ps) / len(ps), "r": sum(rs) / len(rs), "f1": sum(fs) / len(fs)}
+        span_prf_computed = True
+
     out_file = out_dir / "ragtruth_outputs.jsonl"
     with open(out_file, "w", encoding="utf-8") as fh:
         for it in outputs:
@@ -642,6 +688,7 @@ def evaluate_ragtruth(ds, model, sampling_params, out_dir: Path, n_samples: int,
         "response_recall": recall,
         "response_f1": f1,
         "span_prf_avg": span_prf_avg,
+        "span_prf_computed": span_prf_computed,
         "avg_latency_s": (sum(latencies) / len(latencies)) if latencies else None,
         "output_file": str(out_file)
     }
@@ -654,6 +701,7 @@ def sample_indices(total: int, n: int, seed: int = 42) -> List[int]:
     return idxs[:n]
 
 def format_prompt(instruction: str, paragraph: Optional[str] = None) -> str:
+    # Follows the Self-RAG README prompt format.
     p = "### Instruction:\n{0}\n\n### Response:\n".format(instruction)
     if paragraph:
         p += "[Retrieval]<paragraph>{0}</paragraph>".format(paragraph)
@@ -671,6 +719,24 @@ def safe_filename(name: str) -> str:
     """Create a filesystem-safe filename from dataset name."""
     return re.sub(r"[^\w\-_\.]", "_", name)
 
+def coerce_dtype_for_vllm(dtype_arg: str) -> str:
+    """
+    Accept README-style dtype aliases while ensuring compatibility with vLLM.
+    - "half" or "fp16" -> "float16"
+    - "bf16" -> "bfloat16"
+    - pass-through: "auto", "float16", "bfloat16", "float32"
+    """
+    x = (dtype_arg or "").strip().lower()
+    if x in ("half", "fp16"):
+        return "float16"
+    if x in ("bf16",):
+        return "bfloat16"
+    if x in ("auto", "float16", "bfloat16", "float32"):
+        return x
+    # Fall back to float16 with a warning
+    print(f"Warning: dtype '{dtype_arg}' not recognized. Falling back to float16.", file=sys.stderr)
+    return "float16"
+
 # ---------------- Main CLI ----------------
 def main():
     parser = argparse.ArgumentParser(description="Research-grade SELF-RAG evaluation (inference only).")
@@ -679,7 +745,7 @@ def main():
     parser.add_argument("--n_samples", type=int, default=200, help="Number of samples per dataset (max)")
     parser.add_argument("--max_new_tokens", type=int, default=512, help="Max new tokens per sample")
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size for generation")
-    parser.add_argument("--dtype", type=str, default=DEFAULT_DTYPE, help="dtype for vllm (half or float)")
+    parser.add_argument("--dtype", type=str, default=DEFAULT_DTYPE, help="dtype for vllm (README default 'half'; accepted: half/fp16, bf16, auto, float16, bfloat16, float32)")
     parser.add_argument("--output_dir", type=str, default="./selfrag_eval_outputs", help="Directory to save outputs and summary")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
     args = parser.parse_args()
@@ -690,14 +756,20 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # instantiate vllm model
-    llm_kwargs = {}
+    llm_kwargs: Dict[str, Any] = {}
     if args.download_dir:
         llm_kwargs["download_dir"] = args.download_dir
-    print(f"Loading model {args.model_name} with dtype={args.dtype} ...")
-    model = LLM(args.model_name, dtype=args.dtype, **llm_kwargs)
+
+    coerced_dtype = coerce_dtype_for_vllm(args.dtype)
+    if coerced_dtype != (args.dtype or "").strip().lower():
+        print(f"Coercing dtype '{args.dtype}' to '{coerced_dtype}' for vLLM compatibility.")
+
+    print(f"Loading model {args.model_name} with dtype={args.dtype} (vLLM uses: {coerced_dtype}) ...")
+    model = LLM(args.model_name, dtype=coerced_dtype, **llm_kwargs)
+    # Follow README: skip_special_tokens=False to preserve Self-RAG reflection tokens in outputs.
     sampling_params = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=args.max_new_tokens, skip_special_tokens=False)
 
-    # Datasets list (only these)
+    # Datasets list (keep names the same)
     datasets_to_run = [
         ("mwong/fever-evidence-related", "fever"),
         ("microsoft/ms_marco", "msmarco_v2.1"),
@@ -707,7 +779,7 @@ def main():
         ("sentence-transformers/natural-questions", "natural_questions")
     ]
 
-    summary_list = []
+    summary_list: List[Dict[str, Any]] = []
 
     for ds_id, tag in datasets_to_run:
         try:
@@ -780,7 +852,7 @@ def main():
     keys = set()
     for s in summary_list:
         keys.update(s.keys())
-    keys = list(keys)
+    keys = sorted(list(keys))
     with open(summary_csv, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=keys)
         writer.writeheader()
