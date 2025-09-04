@@ -315,6 +315,23 @@ def extract_fields_for_dataset(example: dict, dataset: str) -> Tuple[Optional[st
                     answers = [str(v)]
                 break
 
+    # TriviaQA-specific: gold answers live under 'answer' dict with 'value' and 'aliases'
+    if dataset.startswith("mandarjoshi/trivia_qa"):
+        try:
+            a = example.get("answer") if isinstance(example, dict) else None
+            if isinstance(a, dict):
+                golds: List[str] = []
+                val = a.get("value")
+                if isinstance(val, str) and val.strip():
+                    golds.append(val)
+                aliases = a.get("aliases")
+                if isinstance(aliases, list):
+                    golds.extend([str(x) for x in aliases if isinstance(x, str) and x.strip()])
+                if golds:
+                    answers = golds
+        except Exception:
+            pass
+
     # context
     context = None
     for k in context_candidates:
@@ -618,9 +635,23 @@ def evaluate_generic_qa(ds, model, sampling_params, out_dir: Path, n_samples: in
     print(f"Evaluating {dataset_name} with mode {metric_mode}")
     split = choose_split(ds)
     data = ds[split]
-    total = len(data)
-    n = min(n_samples, total)
-    indices = sample_indices(total, n)
+    # Support both in-memory datasets and streaming IterableDataset
+    supports_index = hasattr(data, "__len__") and hasattr(data, "__getitem__")
+    data_buffer = None
+    if supports_index:
+        total = len(data)
+        n = min(n_samples, total)
+        indices = sample_indices(total, n)
+    else:
+        # Materialize only up to n_samples from the stream
+        try:
+            from itertools import islice
+            data_buffer = list(islice(data, n_samples))
+        except Exception:
+            data_buffer = []
+        total = len(data_buffer)
+        n = total
+        indices = list(range(n))
     outputs = []
     em_sum = 0
     f1_sum = 0.0
@@ -635,7 +666,7 @@ def evaluate_generic_qa(ds, model, sampling_params, out_dir: Path, n_samples: in
         meta_list = []  # tuples (idx, answers, instruction)
 
         for idx in batch_idxs:
-            ex = data[int(idx)]
+            ex = (data_buffer[int(idx)] if data_buffer is not None else data[int(idx)])
             instruction, answers, context, meta = extract_fields_for_dataset(ex, dataset_name)
             if instruction is None:
                 outputs.append({"index": idx, "skipped": True, "reason": "no-question"})
@@ -797,6 +828,23 @@ def _parse_ragtruth_gold_label(ex: dict) -> Optional[int]:
                 if isinstance(v, str) and v.strip():
                     # Heuristic: if it looks like a JSON list and contains '{' assume positive
                     return 1 if "{" in v or "[" in v else 0
+    # Additional common single-label fields used in processed variants
+    # Try boolean/numeric or string forms indicating hallucination presence
+    for k in ["is_hallucinated", "hallucinated", "has_hallucination", "response_label", "response_label_processed", "label", "gold_label"]:
+        if k in ex and ex[k] is not None:
+            val = ex[k]
+            # direct boolean/numeric
+            if isinstance(val, bool):
+                return 1 if val else 0
+            if isinstance(val, (int, float)):
+                return int(bool(val))
+            # strings like "hallucinated" / "clean" / "no_hallucination" etc.
+            if isinstance(val, str):
+                v = val.strip().lower()
+                if v in ("hallucinated", "hallucination", "has_hallucination", "yes", "true", "1", "positive", "pos", "halluc"):
+                    return 1
+                if v in ("not hallucinated", "no_hallucination", "clean", "no", "false", "0", "negative", "neg", "non-hallucinated"):
+                    return 0
     return None
 
 def evaluate_ragtruth(ds, model, sampling_params, out_dir: Path, n_samples: int, batch_size: int):
@@ -842,8 +890,16 @@ def evaluate_ragtruth(ds, model, sampling_params, out_dir: Path, n_samples: int,
         latencies.extend([per_latency] * len(actual_prompts))
 
         for (idx, ex, meta, instruction), text in zip(meta_list, texts):
-            # robust gold parse from dataset-specific fields
+            # robust gold parse from dataset-specific fields, with fallback to detected meta label
             gold_binary: Optional[int] = _parse_ragtruth_gold_label(ex)
+            if gold_binary is None and isinstance(meta, dict):
+                # use previously detected heuristic label if available
+                maybe_meta = meta.get("ragtruth_label")
+                if maybe_meta is not None:
+                    try:
+                        gold_binary = int(bool(maybe_meta))
+                    except Exception:
+                        gold_binary = None
             gold_label = gold_binary  # store for output readability
             # naive predicted detection heuristic:
             lower_txt = text.lower()
@@ -1070,22 +1126,8 @@ def main():
 
             if ds_id == "mandarjoshi/trivia_qa":
                 print("\n--- Loading TriviaQA (rc)")
-                # Load only the validation split to reduce disk usage and avoid generating the large train split.
-                try:
-                    raw_val = load_dataset(ds_id, "rc", split="validation")
-                    # Wrap as a dict so evaluate_generic_qa can pick the split normally
-                    raw = {"validation": raw_val}
-                except Exception:
-                    # Fallback: if validation isn't available, load dev or test minimally
-                    for sp in ["dev", "test", "validation"]:
-                        try:
-                            raw_alt = load_dataset(ds_id, "rc", split=sp)
-                            raw = {sp: raw_alt}
-                            break
-                        except Exception:
-                            raw = None
-                    if raw is None:
-                        raise
+                # Use streaming validation-only to avoid disk-heavy materialization
+                raw = {"validation": load_dataset(ds_id, "rc", split="validation", streaming=True)}
                 summ = evaluate_generic_qa(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size, dataset_name=f"{ds_id}::rc", metric_mode="inclusion")
                 if summ:
                     summary_list.append(summ)
