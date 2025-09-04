@@ -45,6 +45,13 @@ try:
 except Exception as e:
     raise SystemExit("datasets is required. Install with `pip install datasets`. Error: {}".format(e))
 
+# Optional: Hugging Face Hub login for private/authorized models
+try:
+    from huggingface_hub import login as hf_login, HfFolder
+except Exception:
+    hf_login = None
+    HfFolder = None
+
 # ---------------- Constants & thresholds ----------------
 FUZZY_EM_RATIO = 0.92  # SequenceMatcher ratio threshold for fuzzy EM (conservative)
 DEFAULT_BATCH_SIZE = 4
@@ -104,6 +111,46 @@ def token_f1(pred: str, gold: str) -> float:
     prec = same / len(p_tokens)
     rec = same / len(g_tokens)
     return 2 * prec * rec / (prec + rec)
+
+def lcs_length(a_tokens: List[str], b_tokens: List[str]) -> int:
+    """Length of the Longest Common Subsequence between two token lists (O(n*m))."""
+    n, m = len(a_tokens), len(b_tokens)
+    if n == 0 or m == 0:
+        return 0
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        ai = a_tokens[i - 1]
+        for j in range(1, m + 1):
+            if ai == b_tokens[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1] + 1
+            else:
+                dp[i][j] = dp[i - 1][j] if dp[i - 1][j] >= dp[i][j - 1] else dp[i][j - 1]
+    return dp[n][m]
+
+def rouge_l_f1(pred: str, gold: str) -> float:
+    """Compute ROUGE-L F1 using LCS over normalized tokens."""
+    p_tokens = normalize_answer(pred).split()
+    g_tokens = normalize_answer(gold).split()
+    if not p_tokens and not g_tokens:
+        return 1.0
+    if not p_tokens or not g_tokens:
+        return 0.0
+    lcs = lcs_length(p_tokens, g_tokens)
+    if lcs == 0:
+        return 0.0
+    prec = lcs / len(p_tokens)
+    rec = lcs / len(g_tokens)
+    return (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+
+def best_rouge_l_over_golds(pred: str, golds: Optional[List[str]]) -> float:
+    if not golds:
+        return 0.0
+    best = 0.0
+    for g in golds:
+        score = rouge_l_f1(pred, g)
+        if score > best:
+            best = score
+    return best
 
 def best_em_f1_over_golds(pred: str, golds: Optional[List[str]]) -> Tuple[int, float]:
     """Return best EM and best F1 across multiple gold answers"""
@@ -344,6 +391,40 @@ def batched_generate(model: LLM, prompts: List[str], sampling_params: SamplingPa
         return texts
 
 # ---------------- Core evaluation per dataset (batched) ----------------
+def _find_label_from_example(ex: dict, meta: dict) -> Optional[str]:
+    """Look for FEVER label in meta and the raw example under many common keys."""
+    # priority: meta if present
+    candidates = []
+    if isinstance(meta, dict):
+        candidates.extend(["label", "gold_label", "ragtruth_label"])
+        for k in ["label", "gold_label", "verifiable_label", "veracity", "verdict", "claim_label"]:
+            if k in meta:
+                candidates.append(k)
+    # also check the raw example
+    candidates.extend(["label", "gold_label", "verifiable_label", "veracity", "verdict", "claim_label", "verifiable"])
+    # finally any key that looks promising
+    for k in list(ex.keys()):
+        if k.lower() in ("label", "gold_label", "verifiable_label", "veracity", "verdict", "claim_label"):
+            candidates.append(k)
+    # dedupe preserve order
+    seen = set()
+    final_candidates = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            final_candidates.append(c)
+    # check them
+    for k in final_candidates:
+        if isinstance(meta, dict) and k in meta and meta[k] is not None:
+            return meta[k]
+        if k in ex and ex[k] is not None:
+            return ex[k]
+    # fallback: some datasets store label under 'annotations' or nested dicts
+    for k, v in ex.items():
+        if isinstance(k, str) and "label" in k.lower():
+            return v
+    return None
+
 def evaluate_fever(ds, model, sampling_params, out_dir: Path, n_samples: int, batch_size: int):
     """FEVER: treat as classification (accuracy). The dataset may have claims and labels like SUPPORTS/REFUTES/NOT ENOUGH INFO."""
     print("Evaluating FEVER (accuracy)")
@@ -355,12 +436,13 @@ def evaluate_fever(ds, model, sampling_params, out_dir: Path, n_samples: int, ba
     outputs = []
     correct = 0
     latencies = []
+    label_mode_used = None  # '3way' or 'binary'
 
     # batch processing
     for i in range(0, len(indices), batch_size):
         batch_idxs = indices[i : i + batch_size]
         actual_prompts = []
-        prompt_meta = []  # (idx, meta, instruction)
+        prompt_meta = []  # (idx, ex, meta, instruction)
 
         # build prompts for this batch
         for idx in batch_idxs:
@@ -371,7 +453,7 @@ def evaluate_fever(ds, model, sampling_params, out_dir: Path, n_samples: int, ba
                 continue
             prompt = format_prompt(f"Verify this claim: {instruction}\nAnswer with one of: SUPPORTS, REFUTES, NOT ENOUGH INFO.")
             actual_prompts.append(prompt)
-            prompt_meta.append((idx, meta, instruction))
+            prompt_meta.append((idx, ex, meta, instruction))
 
         if not actual_prompts:
             continue
@@ -382,26 +464,70 @@ def evaluate_fever(ds, model, sampling_params, out_dir: Path, n_samples: int, ba
         per_latency = (t1 - t0) / max(1, len(actual_prompts))
         latencies.extend([per_latency] * len(actual_prompts))
 
-        for (idx, meta, instruction), text in zip(prompt_meta, texts):
-            gold_label = meta.get("label") if isinstance(meta, dict) else None
+        for (idx, ex, meta, instruction), text in zip(prompt_meta, texts):
             mapped = map_to_fever_label(text)
             correct_flag = 0
+            gold_label = _find_label_from_example(ex, meta)
+            binary_gold = None
+            mode = None
+            # Determine if the found gold label is numeric/binary
+            def as_binary(val):
+                try:
+                    if isinstance(val, bool):
+                        return int(val)
+                    if isinstance(val, (int, float)):
+                        return int(val)
+                    if isinstance(val, str) and val.strip() in {"0", "1"}:
+                        return int(val.strip())
+                except Exception:
+                    pass
+                return None
+
             if gold_label is not None:
-                if normalize_label_compare(mapped, gold_label):
-                    correct_flag = 1
+                # If it's numeric-like, use binary comparison
+                maybe_bin = as_binary(gold_label)
+                if maybe_bin is not None:
+                    binary_gold = maybe_bin
+                    pred_binary = 1 if mapped == "SUPPORTS" else 0
+                    if pred_binary == binary_gold:
+                        correct_flag = 1
+                    mode = "binary"
+                else:
+                    # 3-way textual gold label
+                    try:
+                        gold_label_str = str(gold_label)
+                    except Exception:
+                        gold_label_str = None
+                    if gold_label_str and normalize_label_compare(mapped, gold_label_str):
+                        correct_flag = 1
+                    mode = "3way"
+            else:
+                # Try dataset-specific numeric label (0/1) under 'labels'
+                if isinstance(ex, dict) and "labels" in ex:
+                    binary_gold = as_binary(ex.get("labels"))
+                    if binary_gold is not None:
+                        pred_binary = 1 if mapped == "SUPPORTS" else 0
+                        if pred_binary == binary_gold:
+                            correct_flag = 1
+                        mode = "binary"
+            if mode and (label_mode_used is None):
+                label_mode_used = mode
             outputs.append({
                 "index": idx,
                 "instruction": instruction,
                 "model_raw": text,
                 "pred_label": mapped,
                 "gold_label": gold_label,
+                "binary_gold": binary_gold,
+                "mode_used": mode,
                 "correct": correct_flag,
                 "latency_s": per_latency
             })
             correct += correct_flag
 
-    evaluated = len([o for o in outputs if not o.get("skipped", False)])
-    accuracy = correct / evaluated if evaluated else 0.0
+    # Only count examples where a gold label exists
+    evaluated = len([o for o in outputs if (not o.get("skipped", False)) and ((o.get("gold_label") is not None) or (o.get("binary_gold") is not None))])
+    accuracy = correct / evaluated if evaluated else None
     out_file = out_dir / "fever_outputs.jsonl"
     with open(out_file, "w", encoding="utf-8") as fh:
         for item in outputs:
@@ -411,6 +537,7 @@ def evaluate_fever(ds, model, sampling_params, out_dir: Path, n_samples: int, ba
         "split": split,
         "examples_evaluated": evaluated,
         "accuracy": accuracy,
+        "fever_label_mode": label_mode_used,
         "avg_latency_s": (sum(latencies) / len(latencies)) if latencies else None,
         "output_file": str(out_file)
     }
@@ -497,6 +624,7 @@ def evaluate_generic_qa(ds, model, sampling_params, out_dir: Path, n_samples: in
     outputs = []
     em_sum = 0
     f1_sum = 0.0
+    rougeL_sum = 0.0
     inclusion_sum = 0
     latencies = []
 
@@ -512,6 +640,40 @@ def evaluate_generic_qa(ds, model, sampling_params, out_dir: Path, n_samples: in
             if instruction is None:
                 outputs.append({"index": idx, "skipped": True, "reason": "no-question"})
                 continue
+            # MS MARCO-specific: prefer well-formed answers when available
+            if ("microsoft/ms_marco" in dataset_name) or ("msmarco" in dataset_name):
+                try:
+                    wf = None
+                    # Common field name is 'wellFormedAnswers' (list of strings). Handle a few variants defensively.
+                    for k in ["wellFormedAnswers", "well_formed_answers", "wellformedanswers"]:
+                        if isinstance(ex, dict) and k in ex and ex[k]:
+                            wf = ex[k]
+                            break
+                    if wf:
+                        if isinstance(wf, dict) and "text" in wf:
+                            wf_list = wf["text"] if isinstance(wf["text"], list) else [wf["text"]]
+                        elif isinstance(wf, list):
+                            wf_list = [str(x) for x in wf if x is not None]
+                        else:
+                            wf_list = [str(wf)]
+                        # Replace answers if well-formed are non-empty
+                        if any(s and str(s).strip() for s in wf_list):
+                            answers = wf_list
+                    # Fallback to 'answers' if still empty; ensure list[str]
+                    if not answers:
+                        a = ex.get("answers") if isinstance(ex, dict) else None
+                        if isinstance(a, dict):
+                            if "text" in a:
+                                answers = a["text"] if isinstance(a["text"], list) else [a["text"]]
+                            elif "answer" in a:
+                                answers = a["answer"] if isinstance(a["answer"], list) else [a["answer"]]
+                        elif isinstance(a, list):
+                            answers = [str(x) for x in a]
+                        elif isinstance(a, str):
+                            answers = [a]
+                except Exception:
+                    # Non-fatal; keep previously extracted answers
+                    pass
             actual_prompts.append(format_prompt(instruction, paragraph=context))
             meta_list.append((idx, answers, instruction))
 
@@ -526,9 +688,34 @@ def evaluate_generic_qa(ds, model, sampling_params, out_dir: Path, n_samples: in
 
         for (idx, answers, instruction), text in zip(meta_list, texts):
             if metric_mode == "em_f1":
-                em, f1 = best_em_f1_over_golds(text, answers)
+                # MS MARCO: use strict EM (normalized equality only); F1 as usual
+                if ("microsoft/ms_marco" in dataset_name) or ("msmarco" in dataset_name):
+                    def _strict_best_em_f1(pred: str, golds: Optional[List[str]]):
+                        if not golds:
+                            return 0, 0.0
+                        best_em = 0
+                        best_f1 = 0.0
+                        npred = normalize_answer(pred)
+                        for g in golds:
+                            ng = normalize_answer(g)
+                            em_v = 1 if npred == ng else 0
+                            f1_v = token_f1(pred, g)
+                            if em_v > best_em:
+                                best_em = em_v
+                            if f1_v > best_f1:
+                                best_f1 = f1_v
+                        return best_em, best_f1
+                    em, f1 = _strict_best_em_f1(text, answers)
+                else:
+                    em, f1 = best_em_f1_over_golds(text, answers)
                 em_sum += em
                 f1_sum += f1
+                # Add ROUGE-L for MS MARCO (common scoring)
+                if "microsoft/ms_marco" in dataset_name or "msmarco" in dataset_name:
+                    rougeL = best_rouge_l_over_golds(text, answers)
+                    rougeL_sum += rougeL
+                else:
+                    rougeL = None
                 outputs.append({
                     "index": idx,
                     "instruction": instruction,
@@ -536,6 +723,7 @@ def evaluate_generic_qa(ds, model, sampling_params, out_dir: Path, n_samples: in
                     "gold": answers,
                     "em": em,
                     "f1": f1,
+                    **({"rougeL": rougeL} if rougeL is not None else {}),
                     "latency_s": per_latency
                 })
             elif metric_mode == "inclusion":
@@ -558,14 +746,25 @@ def evaluate_generic_qa(ds, model, sampling_params, out_dir: Path, n_samples: in
                     "latency_s": per_latency
                 })
 
-    evaled = len([o for o in outputs if not o.get("skipped", False)])
-    summary = {"dataset": dataset_name, "split": split, "examples_evaluated": evaled, "output_file": str(out_dir / f"{safe_filename(dataset_name)}_outputs.jsonl")}
+    # Only count examples that have any non-empty gold answers for metric calculations
+    def has_gold(o):
+        g = o.get("gold")
+        return isinstance(g, list) and any((isinstance(x, str) and x.strip()) for x in g)
+    evaled = len([o for o in outputs if (not o.get("skipped", False)) and has_gold(o)])
+    summary = {
+        "dataset": dataset_name,
+        "split": split,
+        "examples_evaluated": evaled,
+        "output_file": str(out_dir / f"{safe_filename(dataset_name)}_outputs.jsonl"),
+    }
     if metric_mode == "em_f1":
-        summary["em"] = (em_sum / evaled) if evaled else 0.0
-        summary["f1"] = (f1_sum / evaled) if evaled else 0.0
+        summary["em"] = (em_sum / evaled) if evaled else None
+        summary["f1"] = (f1_sum / evaled) if evaled else None
+        if evaled and ("microsoft/ms_marco" in dataset_name or "msmarco" in dataset_name):
+            summary["rougeL"] = (rougeL_sum / evaled)
         summary["avg_latency_s"] = (sum(latencies) / len(latencies)) if latencies else None
     elif metric_mode == "inclusion":
-        summary["inclusion_rate"] = (inclusion_sum / evaled) if evaled else 0.0
+        summary["inclusion_rate"] = (inclusion_sum / evaled) if evaled else None
         summary["avg_latency_s"] = (sum(latencies) / len(latencies)) if latencies else None
 
     out_file = out_dir / f"{safe_filename(dataset_name)}_outputs.jsonl"
@@ -573,6 +772,32 @@ def evaluate_generic_qa(ds, model, sampling_params, out_dir: Path, n_samples: in
         for it in outputs:
             fh.write(json.dumps(it, ensure_ascii=False) + "\n")
     return summary
+
+def _parse_ragtruth_gold_label(ex: dict) -> Optional[int]:
+    """Parse RAGTruth gold: 1 if any hallucination labels present, else 0. Returns None if unknown."""
+    if not isinstance(ex, dict):
+        return None
+    # Candidates: 'hallucination_labels', 'hallucination_labels_processed'
+    for k in ["hallucination_labels", "hallucination_labels_processed"]:
+        if k in ex and ex[k] is not None:
+            v = ex[k]
+            try:
+                # Some fields are JSON strings
+                if isinstance(v, str):
+                    v_parsed = json.loads(v)
+                else:
+                    v_parsed = v
+                if isinstance(v_parsed, list):
+                    return 1 if len(v_parsed) > 0 else 0
+                # If dict with spans, consider any key presence
+                if isinstance(v_parsed, dict):
+                    return 1 if len(v_parsed) > 0 else 0
+            except Exception:
+                # If parsing fails, treat non-empty string as positive signal
+                if isinstance(v, str) and v.strip():
+                    # Heuristic: if it looks like a JSON list and contains '{' assume positive
+                    return 1 if "{" in v or "[" in v else 0
+    return None
 
 def evaluate_ragtruth(ds, model, sampling_params, out_dir: Path, n_samples: int, batch_size: int):
     """
@@ -594,7 +819,7 @@ def evaluate_ragtruth(ds, model, sampling_params, out_dir: Path, n_samples: int,
     for i in range(0, len(indices), batch_size):
         batch_idxs = indices[i : i + batch_size]
         actual_prompts = []
-        meta_list = []  # (idx, meta, instruction)
+        meta_list = []  # (idx, ex, meta, instruction)
 
         for idx in batch_idxs:
             ex = data[int(idx)]
@@ -605,7 +830,7 @@ def evaluate_ragtruth(ds, model, sampling_params, out_dir: Path, n_samples: int,
                 outputs.append({"index": idx, "skipped": True, "reason": "no-query"})
                 continue
             actual_prompts.append(format_prompt(instruction, paragraph=context))
-            meta_list.append((idx, meta, instruction))
+            meta_list.append((idx, ex, meta, instruction))
 
         if not actual_prompts:
             continue
@@ -616,20 +841,10 @@ def evaluate_ragtruth(ds, model, sampling_params, out_dir: Path, n_samples: int,
         per_latency = (t1 - t0) / max(1, len(actual_prompts))
         latencies.extend([per_latency] * len(actual_prompts))
 
-        for (idx, meta, instruction), text in zip(meta_list, texts):
-            gold_label = None
-            if isinstance(meta, dict):
-                gold_label = meta.get("ragtruth_label") or meta.get("gold_label") or meta.get("label")
-            # convert gold to binary if possible
-            gold_binary: Optional[int] = None
-            if isinstance(gold_label, str):
-                gl = gold_label.strip().lower()
-                if gl in ("yes", "true", "1", "hallucinated", "halluc"):
-                    gold_binary = 1
-                elif gl in ("no", "false", "0", "not_hallucinated", "not enough", "none"):
-                    gold_binary = 0
-            elif isinstance(gold_label, (int, float, bool)):
-                gold_binary = int(bool(gold_label))
+        for (idx, ex, meta, instruction), text in zip(meta_list, texts):
+            # robust gold parse from dataset-specific fields
+            gold_binary: Optional[int] = _parse_ragtruth_gold_label(ex)
+            gold_label = gold_binary  # store for output readability
             # naive predicted detection heuristic:
             lower_txt = text.lower()
             if any(phrase in lower_txt for phrase in ["i don't know", "i do not know", "cannot determine", "no retrieval", "no evidence", "i'm not sure", "not enough information", "i cannot find"]):
@@ -708,8 +923,12 @@ def format_prompt(instruction: str, paragraph: Optional[str] = None) -> str:
     return p
 
 def choose_split(raw_ds) -> str:
-    # prioritize splits
-    for s in ["validation", "test", "validation_matched", "validation_unmatched", "dev", "train"]:
+    """Pick a split, preferring labeled splits over test.
+
+    Many HF datasets hide labels in the test split. To avoid computing
+    misleading zeros, we de-prioritize 'test' and prefer validation/dev/train.
+    """
+    for s in ["validation", "dev", "train", "validation_matched", "validation_unmatched", "test"]:
         if s in raw_ds:
             return s
     # default to first available
@@ -737,6 +956,34 @@ def coerce_dtype_for_vllm(dtype_arg: str) -> str:
     print(f"Warning: dtype '{dtype_arg}' not recognized. Falling back to float16.", file=sys.stderr)
     return "float16"
 
+def setup_hf_auth(token: Optional[str]) -> None:
+    """Configure Hugging Face auth from a provided token or environment.
+
+    - If a token is provided (arg or env), export it to common env vars and
+      attempt to persist/login via huggingface_hub when available.
+    - If no token is found, we proceed assuming public access or prior CLI login.
+    """
+    try:
+        tok = token or os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")
+        if tok:
+            # Export to both common env var names so downstream libraries pick it up
+            os.environ["HUGGING_FACE_HUB_TOKEN"] = tok
+            os.environ["HF_TOKEN"] = tok
+            # Persist/login if possible
+            try:
+                if HfFolder is not None:
+                    HfFolder.save_token(tok)
+                if hf_login is not None:
+                    # Avoid touching git credential store
+                    hf_login(token=tok, add_to_git_credential=False)
+                print("Hugging Face token configured from argument/env.")
+            except Exception as ie:
+                print(f"Warning: could not persist/login Hugging Face token: {ie}", file=sys.stderr)
+        else:
+            print("No HF token provided; relying on prior `huggingface-cli login` or public access.", file=sys.stderr)
+    except Exception as e:
+        print(f"Warning: setup_hf_auth encountered an issue: {e}", file=sys.stderr)
+
 # ---------------- Main CLI ----------------
 def main():
     parser = argparse.ArgumentParser(description="Research-grade SELF-RAG evaluation (inference only).")
@@ -748,12 +995,16 @@ def main():
     parser.add_argument("--dtype", type=str, default=DEFAULT_DTYPE, help="dtype for vllm (README default 'half'; accepted: half/fp16, bf16, auto, float16, bfloat16, float32)")
     parser.add_argument("--output_dir", type=str, default="./selfrag_eval_outputs", help="Directory to save outputs and summary")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
+    parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face token (or set HUGGING_FACE_HUB_TOKEN / HF_TOKEN)")
     args = parser.parse_args()
 
     random.seed(args.seed)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Configure HF auth (for private/authorized models or gated datasets)
+    setup_hf_auth(args.hf_token)
 
     # instantiate vllm model
     llm_kwargs: Dict[str, Any] = {}
@@ -819,7 +1070,22 @@ def main():
 
             if ds_id == "mandarjoshi/trivia_qa":
                 print("\n--- Loading TriviaQA (rc)")
-                raw = load_dataset(ds_id, "rc")
+                # Load only the validation split to reduce disk usage and avoid generating the large train split.
+                try:
+                    raw_val = load_dataset(ds_id, "rc", split="validation")
+                    # Wrap as a dict so evaluate_generic_qa can pick the split normally
+                    raw = {"validation": raw_val}
+                except Exception:
+                    # Fallback: if validation isn't available, load dev or test minimally
+                    for sp in ["dev", "test", "validation"]:
+                        try:
+                            raw_alt = load_dataset(ds_id, "rc", split=sp)
+                            raw = {sp: raw_alt}
+                            break
+                        except Exception:
+                            raw = None
+                    if raw is None:
+                        raise
                 summ = evaluate_generic_qa(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size, dataset_name=f"{ds_id}::rc", metric_mode="inclusion")
                 if summ:
                     summary_list.append(summ)
