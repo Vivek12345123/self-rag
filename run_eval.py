@@ -2400,9 +2400,71 @@ def main():
                 print("\n--- Loading MS MARCO v2.1")
                 # Load MS MARCO explicitly as requested
                 ds = load_dataset("microsoft/ms_marco", "v2.1")
-                summ = evaluate_ms_marco(ds, model, sampling_params, out_dir, args.n_samples, args.batch_size)
-                if summ:
-                    summary_list.append(summ)
+                # generate candidates using generic QA flow but collect a single predicted answer per query
+                print('Generating MS MARCO candidate answers (will run official evaluator)')
+                # We'll create reference and candidate JSONL files with fields {"query_id": id, "answers": [..]}
+                ref_file = out_dir / 'msmarco_reference.jsonl'
+                cand_file = out_dir / 'msmarco_candidate.jsonl'
+                # write references
+                with open(ref_file, 'w', encoding='utf-8') as rf:
+                    split = choose_split(ds)
+                    for ex in ds[split][:args.n_samples]:
+                        qid = ex.get('query_id') or ex.get('id') or ex.get('qid')
+                        answers = ex.get('answers') or ex.get('answers_text') or ex.get('answers', [])
+                        if isinstance(answers, str):
+                            answers = [answers]
+                        rf.write(json.dumps({"query_id": int(qid) if qid is not None else None, "answers": answers}) + '\n')
+                # generate predictions (single-pass batched)
+                # re-use evaluate_generic_qa but force one prediction per item and write candidate file
+                split = choose_split(ds)
+                data = ds[split]
+                total = len(data)
+                n = min(args.n_samples, total)
+                indices = sample_indices(total, n)
+                preds = []
+                for i in range(0, len(indices), args.batch_size):
+                    batch = indices[i:i+args.batch_size]
+                    prompts = []
+                    metas = []
+                    for idx in batch:
+                        ex = data[int(idx)]
+                        instruction, answers, context, meta = extract_fields_for_dataset(ex, 'microsoft/ms_marco')
+                        if instruction is None:
+                            prompts.append(format_prompt('', paragraph=''))
+                            metas.append((idx, ex, answers))
+                        else:
+                            prompts.append(format_prompt(instruction, paragraph=context))
+                            metas.append((idx, ex, answers))
+                    texts = batched_generate(model, prompts, sampling_params)
+                    for (idx, ex, answers), text in zip(metas, texts):
+                        qid = ex.get('query_id') or ex.get('id') or ex.get('qid')
+                        # write one predicted answer per query
+                        preds.append({"query_id": int(qid) if qid is not None else None, "answers": [text]})
+                with open(cand_file, 'w', encoding='utf-8') as cf:
+                    for p in preds:
+                        cf.write(json.dumps(p) + '\n')
+
+                # run official evaluator and capture stdout metrics
+                eval_script = Path(__file__).parent / 'evals' / 'ms_marco_eval.py'
+                cmd = [sys.executable, str(eval_script), str(ref_file), str(cand_file)]
+                print('Running MS MARCO official evaluator:', ' '.join(cmd))
+                p = subprocess.run(cmd, capture_output=True, text=True)
+                ms_out_dir = out_dir / 'official_eval' / 'msmarco'
+                ms_out_dir.mkdir(parents=True, exist_ok=True)
+                (ms_out_dir / 'msmarco_stdout.txt').write_text(p.stdout + '\n' + p.stderr, encoding='utf-8')
+                # try parse printed metrics into JSON
+                ms_metrics = {}
+                try:
+                    for line in p.stdout.splitlines():
+                        if ':' in line:
+                            k, v = line.split(':', 1)
+                            try:
+                                ms_metrics[k.strip()] = float(v.strip())
+                            except Exception:
+                                ms_metrics[k.strip()] = v.strip()
+                except Exception:
+                    ms_metrics = {'raw_stdout': p.stdout}
+                summary_list.append({'dataset': 'microsoft/ms_marco', 'official_metrics': ms_metrics, 'official_eval_stdout_file': str(ms_out_dir / 'msmarco_stdout.txt'), 'output_file': str(cand_file)})
                 continue
 
             if ds_id == "squad_v2":
