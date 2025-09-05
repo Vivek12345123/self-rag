@@ -1,0 +1,65 @@
+[
+  {
+    "dataset": "mwong/fever-evidence-related",
+    "split": "train",
+    "examples_evaluated": 50,
+    "accuracy": 0.58,
+    "fever_label_mode": "binary",
+    "avg_latency_s": 0.12942230376880615,
+    "output_file": "selfrag_eval_outputs_small/fever_outputs.jsonl"
+  },
+  {
+    "dataset": "microsoft/ms_marco",
+    "split": "validation",
+    "examples_evaluated": 0,
+    "note": "No evaluable examples found (no ranked retrieval fields detected).",
+    "output_file": "selfrag_eval_outputs_small/microsoft_ms_marco_outputs.jsonl"
+  },
+  {
+    "dataset": "hotpotqa/hotpot_qa__distractor",
+    "split": "validation",
+    "examples_evaluated": 50,
+    "output_file": "selfrag_eval_outputs_small/hotpotqa_hotpot_qa__distractor_outputs.jsonl",
+    "em": 0.44,
+    "f1": 0.09794347185308702,
+    "avg_latency_s": 0.28976361243985593
+  },
+  {
+    "dataset": "hotpotqa/hotpot_qa__fullwiki",
+    "split": "validation",
+    "examples_evaluated": 50,
+    "output_file": "selfrag_eval_outputs_small/hotpotqa_hotpot_qa__fullwiki_outputs.jsonl",
+    "em": 0.2,
+    "f1": 0.0746207097524674,
+    "avg_latency_s": 0.25999196644406763
+  },
+  {
+    "dataset": "wandb/RAGTruth-processed",
+    "split": "train",
+    "examples_evaluated": 50,
+    "response_precision": 0.10714285714285714,
+    "response_recall": 0.1875,
+    "response_f1": 0.13636363636363635,
+    "span_prf_avg": null,
+    "span_prf_computed": false,
+    "avg_latency_s": 0.7858608778053895,
+    "output_file": "selfrag_eval_outputs_small/ragtruth_outputs.jsonl"
+  },
+  {
+    "dataset": "mandarjoshi/trivia_qa::rc",
+    "split": "validation",
+    "examples_evaluated": 50,
+    "output_file": "selfrag_eval_outputs_small/mandarjoshi_trivia_qa__rc_outputs.jsonl",
+    "inclusion_rate": 0.4,
+    "avg_latency_s": 0.2182490433845669
+  },
+  {
+    "dataset": "sentence-transformers/natural-questions",
+    "split": "train",
+    "examples_evaluated": 50,
+    "output_file": "selfrag_eval_outputs_small/sentence-transformers_natural-questions_outputs.jsonl",
+    "em": 0.0,
+    "f1": 0.07155397172776967,
+    "avg_latency_s": 0.21351862074807287
+  }
+]

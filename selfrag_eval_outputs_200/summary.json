@@ -1,0 +1,65 @@
+[
+  {
+    "dataset": "mwong/fever-evidence-related",
+    "split": "train",
+    "examples_evaluated": 200,
+    "accuracy": 0.435,
+    "fever_label_mode": "binary",
+    "avg_latency_s": 0.1347150906070601,
+    "output_file": "selfrag_eval_outputs_200/fever_outputs.jsonl"
+  },
+  {
+    "dataset": "microsoft/ms_marco",
+    "split": "validation",
+    "examples_evaluated": 0,
+    "note": "No evaluable examples found (no ranked retrieval fields detected).",
+    "output_file": "selfrag_eval_outputs_200/microsoft_ms_marco_outputs.jsonl"
+  },
+  {
+    "dataset": "hotpotqa/hotpot_qa__distractor",
+    "split": "validation",
+    "examples_evaluated": 200,
+    "output_file": "selfrag_eval_outputs_200/hotpotqa_hotpot_qa__distractor_outputs.jsonl",
+    "em": 0.46,
+    "f1": 0.10620616304089311,
+    "avg_latency_s": 0.32537517700344326
+  },
+  {
+    "dataset": "hotpotqa/hotpot_qa__fullwiki",
+    "split": "validation",
+    "examples_evaluated": 200,
+    "output_file": "selfrag_eval_outputs_200/hotpotqa_hotpot_qa__fullwiki_outputs.jsonl",
+    "em": 0.28,
+    "f1": 0.072880205822524,
+    "avg_latency_s": 0.38775418988312593
+  },
+  {
+    "dataset": "wandb/RAGTruth-processed",
+    "split": "train",
+    "examples_evaluated": 200,
+    "response_precision": 0.2743362831858407,
+    "response_recall": 0.3875,
+    "response_f1": 0.3212435233160622,
+    "span_prf_avg": null,
+    "span_prf_computed": false,
+    "avg_latency_s": 0.6679025764658582,
+    "output_file": "selfrag_eval_outputs_200/ragtruth_outputs.jsonl"
+  },
+  {
+    "dataset": "mandarjoshi/trivia_qa::rc",
+    "split": "validation",
+    "examples_evaluated": 200,
+    "output_file": "selfrag_eval_outputs_200/mandarjoshi_trivia_qa__rc_outputs.jsonl",
+    "inclusion_rate": 0.4,
+    "avg_latency_s": 0.17684666635352186
+  },
+  {
+    "dataset": "sentence-transformers/natural-questions",
+    "split": "train",
+    "examples_evaluated": 200,
+    "output_file": "selfrag_eval_outputs_200/sentence-transformers_natural-questions_outputs.jsonl",
+    "em": 0.0,
+    "f1": 0.07966856774527296,
+    "avg_latency_s": 0.2392139507632237
+  }
+]

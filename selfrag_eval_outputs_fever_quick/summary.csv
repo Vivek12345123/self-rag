@@ -1,0 +1,9 @@
+accuracy,avg_latency_s,dataset,em,evidence_f1_macro,evidence_f1_micro,evidence_precision_micro,evidence_recall_micro,examples_evaluated,f1,fever_label_mode,fever_score,inclusion_rate,note,output_file,per_label_metrics,response_f1,response_precision,response_recall,span_prf_avg,span_prf_computed,split
+0.0,0.19038317932281643,mwong/fever-evidence-related,,0.0,,0.0,0.0,10,,binary,0.0,,,selfrag_eval_outputs_fever_quick/fever_outputs.jsonl,"{'0': {'p': 0.0, 'r': 0.0, 'f1': None, 'examples': 7}, '1': {'p': 0.0, 'r': 0.0, 'f1': None, 'examples': 3}}",,,,,,train
+,,microsoft/ms_marco,,,,,,0,,,,,No evaluable examples found (no ranked retrieval fields detected).,selfrag_eval_outputs_fever_quick/microsoft_ms_marco_outputs.jsonl,,,,,,,validation
+,0.5509374242275953,squad_v2,0.4,,,,,10,0.1151496847734466,,,,,selfrag_eval_outputs_fever_quick/squad_v2_outputs.jsonl,,,,,,,validation
+,0.37791598320472986,hotpotqa/hotpot_qa__distractor,0.7,,,,,10,0.1043896833587236,,,,,selfrag_eval_outputs_fever_quick/hotpotqa_hotpot_qa__distractor_outputs.jsonl,,,,,,,validation
+,0.3300332482904196,hotpotqa/hotpot_qa__fullwiki,0.2,,,,,10,0.05948930296756384,,,,,selfrag_eval_outputs_fever_quick/hotpotqa_hotpot_qa__fullwiki_outputs.jsonl,,,,,,,validation
+,0.5754539765883238,wandb/RAGTruth-processed,,,,,,10,,,,,,selfrag_eval_outputs_fever_quick/ragtruth_outputs.jsonl,,0.0,0.0,0.0,,False,train
+,0.22932189910206943,mandarjoshi/trivia_qa::rc,,,,,,10,,,,0.3,,selfrag_eval_outputs_fever_quick/mandarjoshi_trivia_qa__rc_outputs.jsonl,,,,,,,validation
+,0.2553776648826897,sentence-transformers/natural-questions,0.0,,,,,10,0.07205489593553246,,,,,selfrag_eval_outputs_fever_quick/sentence-transformers_natural-questions_outputs.jsonl,,,,,,,train

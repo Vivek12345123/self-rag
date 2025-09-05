@@ -14,7 +14,7 @@ nltk
 dataclasses
 sacrebleu==2.4.0
 rouge_score==0.1.2
-flash-attn==2.3.6
+
 einops==0.7.0
 sentencepiece
 deepspeed==0.12.6

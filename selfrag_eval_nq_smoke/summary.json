@@ -1,0 +1,97 @@
+[
+  {
+    "dataset": "mwong/fever-evidence-related",
+    "split": "train",
+    "examples_evaluated": 5,
+    "accuracy": 0.0,
+    "fever_label_mode": "binary",
+    "avg_latency_s": 0.24363486557267605,
+    "evidence_precision_micro": null,
+    "evidence_recall_micro": null,
+    "evidence_f1_micro": null,
+    "evidence_f1_macro": 0.0,
+    "per_label_metrics": {
+      "0": {
+        "p": null,
+        "r": null,
+        "f1": null,
+        "examples": 3
+      },
+      "1": {
+        "p": null,
+        "r": null,
+        "f1": null,
+        "examples": 2
+      }
+    },
+    "fever_score": 0.0,
+    "output_file": "selfrag_eval_nq_smoke/fever_outputs.jsonl"
+  },
+  {
+    "dataset": "microsoft/ms_marco",
+    "split": "validation",
+    "examples_evaluated": 0,
+    "note": "No evaluable examples found (no ranked retrieval fields detected).",
+    "output_file": "selfrag_eval_nq_smoke/microsoft_ms_marco_outputs.jsonl"
+  },
+  {
+    "dataset": "squad_v2",
+    "split": "validation",
+    "examples_evaluated": 5,
+    "em": 0.2,
+    "f1": 0.09264287502420147,
+    "avg_latency_s": 0.8523305994458497,
+    "output_file": "selfrag_eval_nq_smoke/squad_v2_outputs.jsonl"
+  },
+  {
+    "dataset": "hotpotqa/hotpot_qa__distractor",
+    "split": "validation",
+    "examples_evaluated": 5,
+    "output_file": "selfrag_eval_nq_smoke/hotpotqa_hotpot_qa__distractor_outputs.jsonl",
+    "em": 0.8,
+    "f1": 0.11803862597670647,
+    "avg_latency_s": 0.5693749075289816
+  },
+  {
+    "dataset": "hotpotqa/hotpot_qa__fullwiki",
+    "split": "validation",
+    "examples_evaluated": 5,
+    "output_file": "selfrag_eval_nq_smoke/hotpotqa_hotpot_qa__fullwiki_outputs.jsonl",
+    "em": 0.2,
+    "f1": 0.07453416149068323,
+    "avg_latency_s": 0.5036621964070946
+  },
+  {
+    "dataset": "wandb/RAGTruth-processed",
+    "split": "train",
+    "examples_evaluated": 5,
+    "response_precision": 0.0,
+    "response_recall": 0.0,
+    "response_f1": 0.0,
+    "span_prf_avg": null,
+    "span_prf_computed": false,
+    "avg_latency_s": 0.720974698336795,
+    "output_file": "selfrag_eval_nq_smoke/ragtruth_outputs.jsonl"
+  },
+  {
+    "dataset": "mandarjoshi/trivia_qa::rc",
+    "split": "validation",
+    "examples_evaluated": 5,
+    "output_file": "selfrag_eval_nq_smoke/mandarjoshi_trivia_qa__rc_outputs.jsonl",
+    "inclusion_rate": 0.2,
+    "avg_latency_s": 0.3092467109672725
+  },
+  {
+    "dataset": "sentence-transformers/natural-questions",
+    "split": "train",
+    "examples_evaluated": 5,
+    "short_em": 0.0,
+    "short_f1": 0.0,
+    "long_em": 0.0,
+    "long_f1": 0.0,
+    "combined_em": 0.0,
+    "combined_f1": 0.0,
+    "avg_latency_s": 0.5759481879416853,
+    "output_file": "selfrag_eval_nq_smoke/natural-questions_outputs.jsonl"
+  }
+]

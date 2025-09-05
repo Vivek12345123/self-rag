@@ -1,0 +1,9 @@
+avg_latency_s,combined_em,combined_f1,dataset,em,evidence_f1_micro,evidence_precision_micro,evidence_recall_micro,examples_evaluated,f1,fever_score,inclusion_rate,label_accuracy,long_em,long_f1,note,output_file,response_f1,response_precision,response_recall,short_em,short_f1,span_prf_avg,span_prf_computed,split
+0.13424245140515267,,,mwong/fever-evidence-related,,0.0,0.0,0.0,100,,0.48,,0.48,,,,selfrag_eval_larger_smoke/fever_outputs.jsonl,,,,,,,,train
+,,,microsoft/ms_marco,,,,,0,,,,,,,No evaluable examples found (no ranked retrieval fields detected).,selfrag_eval_larger_smoke/microsoft_ms_marco_outputs.jsonl,,,,,,,,validation
+0.2940834662900306,,,squad_v2,0.36,,,,100,0.10300380458660659,,,,,,,selfrag_eval_larger_smoke/squad_v2_outputs.jsonl,,,,,,,,validation
+0.31799985726363955,,,hotpotqa/hotpot_qa__distractor,0.41,,,,100,0.09355450888301935,,,,,,,selfrag_eval_larger_smoke/hotpotqa_hotpot_qa__distractor_outputs.jsonl,,,,,,,,validation
+0.2974084287579171,,,hotpotqa/hotpot_qa__fullwiki,0.25,,,,100,0.0671418753650988,,,,,,,selfrag_eval_larger_smoke/hotpotqa_hotpot_qa__fullwiki_outputs.jsonl,,,,,,,,validation
+0.7224626621231437,,,wandb/RAGTruth-processed,,,,,100,,,,,,,,selfrag_eval_larger_smoke/ragtruth_outputs.jsonl,0.25263157894736843,0.20689655172413793,0.32432432432432434,,,,False,train
+0.17749348142417148,,,mandarjoshi/trivia_qa::rc,,,,,100,,,0.42,,,,,selfrag_eval_larger_smoke/mandarjoshi_trivia_qa__rc_outputs.jsonl,,,,,,,,validation
+0.2615665611368604,0.43,0.43,sentence-transformers/natural-questions,,,,,100,,,,,0.86,0.86,,selfrag_eval_larger_smoke/natural-questions_outputs.jsonl,,,,0.0,0.0,,,validation
