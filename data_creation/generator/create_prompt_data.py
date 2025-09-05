@@ -6,7 +6,7 @@ import spacy
 
 nlp = spacy.load("en_core_web_sm")
 separation_str = "\n\n### Response:\n"
-TASK_DATA = ["wow", "fever", "arc_easy", "arc_hard", "obqa", "qrecc", "race", "asqa"]
+TASK_DATA = ["wow", "fever", "arc_easy", "arc_hard", "obqa", "qrecc", "asqa"]
 
 TASK_INST = {"wow": "Given a chat history separated by new lines, generates an informative, knowledgeable and engaging response. ",
             "fever": "Is the following statement correct or not? Say true if it's correct; otherwise say false.",

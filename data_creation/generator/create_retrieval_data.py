@@ -5,7 +5,7 @@ import json
 import os
 import spacy
 nlp = spacy.load("en_core_web_sm")
-TASK_DATA = ["nq", "wow", "fever", "tqa", "arc_easy", "arc_hard", "obqa", "qrecc", "race", "asqa"]
+TASK_DATA = ["nq", "wow", "fever", "tqa", "arc_easy", "arc_hard", "obqa", "qrecc", "asqa"]
 def split_sentences(paragraph):
     doc = nlp(paragraph)
     sentences = []

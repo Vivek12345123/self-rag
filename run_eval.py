@@ -1927,160 +1927,8 @@ def evaluate_nq(ds, model, sampling_params, out_dir: Path, n_samples: int, batch
         "official_predictions_file": official_preds_path,
     }
 
-def evaluate_race(ds, model, sampling_params, out_dir: Path, n_samples: int, batch_size: int):
-    """
-    RACE multiple-choice evaluation.
-    Expects model predictions as integer indices 0-3 for each example.
-    This evaluator will prompt the model with the passage+question+options and parse a predicted index.
-    Returns accuracy, macro precision/recall/f1 and confusion matrix.
-    """
-    print("Evaluating RACE (multiple-choice)")
-    split = choose_split(ds)
-    data = ds[split]
-    total = len(data)
-    n = min(n_samples, total)
-    indices = sample_indices(total, n)
-
-    preds = []
-    golds = []
-    outputs = []
-    latencies = []
-
-    # simple parser: look for digit 0-3 or option letter A-D
-    def parse_pred(text: str) -> Optional[int]:
-        if text is None:
-            return None
-        t = text.strip()
-        # try find single digit 0-3
-        m = re.search(r"\b([0-3])\b", t)
-        if m:
-            return int(m.group(1))
-        # try letter A-D
-        m2 = re.search(r"\b([A-Da-d])\b", t)
-        if m2:
-            c = m2.group(1).upper()
-            return ord(c) - ord('A')
-        # try words 'option 1' etc
-        m3 = re.search(r"option\s*([1-4])", t, flags=re.I)
-        if m3:
-            return int(m3.group(1)) - 1
-        return None
-
-    # batching
-    for i in range(0, len(indices), batch_size):
-        batch = indices[i:i+batch_size]
-        prompts = []
-        metas = []
-        for idx in batch:
-            ex = data[int(idx)]
-            passage = ex.get('article') or ex.get('passage') or ex.get('context') or ''
-            question = ex.get('question') or ex.get('query') or ''
-            options = ex.get('options') or ex.get('choices') or []
-            if not options:
-                # fallback: try fields 'options' with keys
-                opts = []
-                for k in ['option1','option2','option3','option4']:
-                    if k in ex:
-                        opts.append(ex[k])
-                options = opts
-            # build prompt
-            opt_text = '\n'.join([f"{i}. {o}" for i,o in enumerate(options)])
-            prompt = format_prompt(f"Passage:\n{passage}\n\nQuestion: {question}\nOptions:\n{opt_text}\nAnswer with the option index 0-3.")
-            prompts.append(prompt)
-            metas.append((idx, ex, options))
-
-        t0 = time.perf_counter()
-        texts = batched_generate(model, prompts, sampling_params)
-        t1 = time.perf_counter()
-        per_latency = (t1 - t0) / max(1, len(prompts))
-        latencies.extend([per_latency]*len(prompts))
-
-        for (idx, ex, options), text in zip(metas, texts):
-            pred_idx = parse_pred(text)
-            gold = ex.get('answer')
-            try:
-                gold_idx = int(gold)
-            except Exception:
-                # sometimes deposited as 'A','B','C','D'
-                if isinstance(gold, str) and gold.upper() in ('A','B','C','D'):
-                    gold_idx = ord(gold.upper()) - ord('A')
-                else:
-                    gold_idx = None
-            preds.append(pred_idx if pred_idx is not None else -1)
-            golds.append(gold_idx if gold_idx is not None else -1)
-            outputs.append({
-                'index': idx,
-                'question': ex.get('question'),
-                'options': options,
-                'gold': gold_idx,
-                'pred': pred_idx,
-                'raw': text,
-                'latency_s': per_latency
-            })
-
-    # compute metrics, filter out examples where gold is invalid (-1)
-    paired = [(g,p) for g,p in zip(golds,preds) if g is not None and g >= 0]
-    if not paired:
-        summary = {
-            'dataset': 'ehovy/race',
-            'split': split,
-            'examples_evaluated': 0,
-            'note': 'No evaluable examples found',
-            'output_file': str(out_dir / 'race_outputs.jsonl')
-        }
-        return summary
-
-    golds_f = [g for g,p in paired]
-    preds_f = [p for g,p in paired]
-
-    # accuracy
-    correct = sum(1 for g,p in zip(golds_f,preds_f) if g == p)
-    accuracy = correct / len(golds_f)
-
-    # confusion matrix 4x4
-    import math
-    K = 4
-    conf = [[0]*K for _ in range(K)]
-    for g,p in zip(golds_f,preds_f):
-        if 0 <= g < K and 0 <= p < K:
-            conf[g][p] += 1
-
-    # per-class precision/recall/f1 (macro)
-    precisions = []
-    recalls = []
-    f1s = []
-    for c in range(K):
-        tp = conf[c][c]
-        fp = sum(conf[r][c] for r in range(K) if r != c)
-        fn = sum(conf[c][r] for r in range(K) if r != c)
-        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
-        precisions.append(prec)
-        recalls.append(rec)
-        f1s.append(f1)
-
-    precision_macro = sum(precisions) / K
-    recall_macro = sum(recalls) / K
-    f1_macro = sum(f1s) / K
-
-    out_file = out_dir / 'race_outputs.jsonl'
-    with open(out_file, 'w', encoding='utf-8') as fh:
-        for it in outputs:
-            fh.write(json.dumps(it, ensure_ascii=False) + "\n")
-
-    return {
-        'dataset': 'ehovy/race',
-        'split': split,
-        'examples_evaluated': len(golds_f),
-        'accuracy': accuracy,
-        'precision_macro': precision_macro,
-        'recall_macro': recall_macro,
-        'f1_macro': f1_macro,
-        'confusion_matrix': conf,
-        'avg_latency_s': (sum(latencies)/len(latencies)) if latencies else None,
-        'output_file': str(out_file)
-    }
+# RACE evaluation removed per user request. Any references to RACE dataset are handled by
+# generic evaluation flows or removed from the datasets list elsewhere.
 
 def _parse_ragtruth_gold_label(ex: dict) -> Optional[int]:
     """Parse RAGTruth gold: 1 if any hallucination labels present, else 0. Returns None if unknown."""
@@ -2365,10 +2213,9 @@ def main():
     # Datasets list (keep names the same)
     datasets_to_run = [
         ("mwong/fever-evidence-related", "fever"),
-    ("microsoft/ms_marco", "msmarco_v2.1"),
-    ("squad_v2", "squad_v2"),
-    ("ehovy/race", "race"),
-    ("hotpotqa/hotpot_qa", "hotpot_distractor_and_fullwiki"),
+        ("microsoft/ms_marco", "msmarco_v2.1"),
+        ("squad_v2", "squad_v2"),
+        ("hotpotqa/hotpot_qa", "hotpot_distractor_and_fullwiki"),
         ("wandb/RAGTruth-processed", "ragtruth"),
         ("mandarjoshi/trivia_qa", "trivia_rc"),
         ("google-research-datasets/natural_questions", "natural_questions")
@@ -2378,13 +2225,6 @@ def main():
 
     for ds_id, tag in datasets_to_run:
         try:
-            if ds_id == "ehovy/race":
-                print("\n--- Loading RACE (config: all)\n")
-                raw = load_dataset(ds_id, "all")
-                summ = evaluate_race(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size)
-                if summ:
-                    summary_list.append(summ)
-                continue
             if ds_id == "hotpotqa/hotpot_qa":
                 # generation-only for HotPotQA; official scoring will be delegated to the official script.
                 for cfg in ["distractor", "fullwiki"]:
