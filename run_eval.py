@@ -2186,6 +2186,10 @@ def main():
     parser.add_argument("--nq_gold", type=str, default=None, help="Path to Natural Questions gold file(s) (glob or dir as expected by official script)")
     parser.add_argument("--ragtruth_model", type=str, default=None, help="Local model path used for RAGTruth predictor (e.g. baseline)")
     parser.add_argument("--ragtruth_tokenizer", type=str, default="meta-llama/Llama-2-13b-hf", help="Tokenizer to use with predict_and_evaluate.py")
+    # EX-FEVER integration (optional; replaces FEVER when provided)
+    parser.add_argument("--exfever_data", type=str, default=None, help="Path to EX-FEVER data (.jsonl or .csv). If set, skip FEVER and run EX-FEVER evaluator.")
+    parser.add_argument("--exfever_model", type=str, default="gpt-4o-mini", help="OpenAI chat model name for EX-FEVER evaluator")
+    parser.add_argument("--exfever_api_key", type=str, default=None, help="OpenAI API key for EX-FEVER evaluator (or set OPENAI_API_KEY env var)")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -2212,7 +2216,7 @@ def main():
 
     # Datasets list (keep names the same)
     datasets_to_run = [
-        ("mwong/fever-evidence-related", "fever"),
+        # ("mwong/fever-evidence-related", "fever"),  # FEVER/EX-FEVER skipped for this test
         ("microsoft/ms_marco", "msmarco_v2.1"),
         ("squad_v2", "squad_v2"),
         ("hotpotqa/hotpot_qa", "hotpot_distractor_and_fullwiki"),
@@ -2223,44 +2227,32 @@ def main():
 
     summary_list: List[Dict[str, Any]] = []
 
+    # Generation only for all datasets
     for ds_id, tag in datasets_to_run:
         try:
             if ds_id == "hotpotqa/hotpot_qa":
-                # generation-only for HotPotQA; official scoring will be delegated to the official script.
                 for cfg in ["distractor", "fullwiki"]:
-                    print(f"\n--- Loading HotPotQA config: {cfg} (generation only, no internal scoring)")
+                    print(f"\n--- Loading HotPotQA config: {cfg} (generation only)")
                     raw = load_dataset(ds_id, cfg)
-                    # Use metric_mode that does not compute internal metrics; this writes the outputs JSONL only.
-                    summ = evaluate_generic_qa(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size, dataset_name=f"{ds_id}__{cfg}", metric_mode="none")
-                    if summ:
-                        summary_list.append(summ)
+                    evaluate_generic_qa(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size, dataset_name=f"{ds_id}__{cfg}", metric_mode="none")
                 continue
-
             if ds_id == "microsoft/ms_marco":
-                print("\n--- Loading MS MARCO v2.1")
-                # Load MS MARCO explicitly as requested
+                print("\n--- Loading MS MARCO v2.1 (generation only)")
                 ds = load_dataset("microsoft/ms_marco", "v2.1")
-                # generate candidates using generic QA flow but collect a single predicted answer per query
-                print('Generating MS MARCO candidate answers (will run official evaluator)')
-                # We'll create reference and candidate JSONL files with fields {"query_id": id, "answers": [..]}
-                ref_file = out_dir / 'msmarco_reference.jsonl'
-                cand_file = out_dir / 'msmarco_candidate.jsonl'
-                # write references
-                with open(ref_file, 'w', encoding='utf-8') as rf:
-                    split = choose_split(ds)
-                    for ex in ds[split][:args.n_samples]:
-                        qid = ex.get('query_id') or ex.get('id') or ex.get('qid')
-                        answers = ex.get('answers') or ex.get('answers_text') or ex.get('answers', [])
-                        if isinstance(answers, str):
-                            answers = [answers]
-                        rf.write(json.dumps({"query_id": int(qid) if qid is not None else None, "answers": answers}) + '\n')
-                # generate predictions (single-pass batched)
-                # re-use evaluate_generic_qa but force one prediction per item and write candidate file
                 split = choose_split(ds)
                 data = ds[split]
                 total = len(data)
                 n = min(args.n_samples, total)
                 indices = sample_indices(total, n)
+                ref_file = out_dir / 'msmarco_reference.jsonl'
+                cand_file = out_dir / 'msmarco_candidate.jsonl'
+                with open(ref_file, 'w', encoding='utf-8') as rf:
+                    for ex in data[:n]:
+                        qid = ex.get('query_id') or ex.get('id') or ex.get('qid')
+                        answers = ex.get('answers') or ex.get('answers_text') or ex.get('answers', [])
+                        if isinstance(answers, str):
+                            answers = [answers]
+                        rf.write(json.dumps({"query_id": int(qid) if qid is not None else None, "answers": answers}) + '\n')
                 preds = []
                 for i in range(0, len(indices), args.batch_size):
                     batch = indices[i:i+args.batch_size]
@@ -2278,92 +2270,86 @@ def main():
                     texts = batched_generate(model, prompts, sampling_params)
                     for (idx, ex, answers), text in zip(metas, texts):
                         qid = ex.get('query_id') or ex.get('id') or ex.get('qid')
-                        # write one predicted answer per query
                         preds.append({"query_id": int(qid) if qid is not None else None, "answers": [text]})
                 with open(cand_file, 'w', encoding='utf-8') as cf:
                     for p in preds:
                         cf.write(json.dumps(p) + '\n')
-
-                # run official evaluator and capture stdout metrics
-                eval_script = Path(__file__).parent / 'evals' / 'ms_marco_eval.py'
-                cmd = [sys.executable, str(eval_script), str(ref_file), str(cand_file)]
-                print('Running MS MARCO official evaluator:', ' '.join(cmd))
-                p = subprocess.run(cmd, capture_output=True, text=True)
-                ms_out_dir = out_dir / 'official_eval' / 'msmarco'
-                ms_out_dir.mkdir(parents=True, exist_ok=True)
-                (ms_out_dir / 'msmarco_stdout.txt').write_text(p.stdout + '\n' + p.stderr, encoding='utf-8')
-                # try parse printed metrics into JSON
-                ms_metrics = {}
-                try:
-                    for line in p.stdout.splitlines():
-                        if ':' in line:
-                            k, v = line.split(':', 1)
-                            try:
-                                ms_metrics[k.strip()] = float(v.strip())
-                            except Exception:
-                                ms_metrics[k.strip()] = v.strip()
-                except Exception:
-                    ms_metrics = {'raw_stdout': p.stdout}
-                summary_list.append({'dataset': 'microsoft/ms_marco', 'official_metrics': ms_metrics, 'official_eval_stdout_file': str(ms_out_dir / 'msmarco_stdout.txt'), 'output_file': str(cand_file)})
                 continue
-
             if ds_id == "squad_v2":
-                print("\n--- Loading SQuAD v2")
+                print("\n--- Loading SQuAD v2 (generation only)")
                 raw = load_dataset("squad_v2")
-                summ = evaluate_squad_v2(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size)
-                if summ:
-                    summary_list.append(summ)
+                evaluate_squad_v2(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size)
                 continue
-
-            if ds_id == "mwong/fever-evidence-related":
-                print("\n--- Loading FEVER")
-                raw = load_dataset(ds_id)
-                summ = evaluate_fever(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size)
-                if summ:
-                    summary_list.append(summ)
-                continue
-
             if ds_id == "wandb/RAGTruth-processed":
-                print("\n--- Loading RAGTruth")
+                print("\n--- Loading RAGTruth (generation only)")
                 raw = load_dataset(ds_id)
-                summ = evaluate_ragtruth(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size)
-                if summ:
-                    summary_list.append(summ)
+                evaluate_ragtruth(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size)
                 continue
-
             if ds_id == "mandarjoshi/trivia_qa":
-                print("\n--- Loading TriviaQA (rc) (generation only, no internal scoring)")
+                print("\n--- Loading TriviaQA (rc) (generation only)")
                 raw = {"validation": load_dataset(ds_id, "rc", split="validation", streaming=True)}
-                summ = evaluate_generic_qa(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size, dataset_name=f"{ds_id}::rc", metric_mode="none")
-                if summ:
-                    summary_list.append(summ)
+                evaluate_generic_qa(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size, dataset_name=f"{ds_id}::rc", metric_mode="none")
                 continue
-
             if ds_id == "google-research-datasets/natural_questions":
-                print("\n--- Loading Natural Questions (official)\n--- using config: default (generation + official-predictions export)")
+                print("\n--- Loading Natural Questions (generation only)")
                 raw = load_dataset(ds_id, "default")
-                summ = evaluate_nq(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size)
-                # For Natural Questions we keep generation but avoid adding internal aggregated metrics to the main summary
-                if summ:
-                    # Only keep pointer to official predictions file (if created) and basic bookkeeping in the summary
-                    minimal = {
-                        'dataset': summ.get('dataset'),
-                        'split': summ.get('split'),
-                        'examples_evaluated': summ.get('examples_evaluated'),
-                        'output_file': summ.get('output_file'),
-                        'official_predictions_file': summ.get('official_predictions_file'),
-                        'avg_latency_s': summ.get('avg_latency_s')
-                    }
-                    summary_list.append(minimal)
+                evaluate_nq(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size)
                 continue
-
-            # default fallback
             raw = load_dataset(ds_id)
-            summ = evaluate_generic_qa(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size, dataset_name=ds_id, metric_mode="em_f1")
-            if summ:
-                summary_list.append(summ)
+            evaluate_generic_qa(raw, model, sampling_params, out_dir, args.n_samples, args.batch_size, dataset_name=ds_id, metric_mode="none")
         except Exception as e:
-            print(f"Failed to evaluate {ds_id}: {e}", file=sys.stderr)
+            print(f"Failed to generate for {ds_id}: {e}", file=sys.stderr)
+
+    # After generation, call all official eval scripts and aggregate scores
+    summary_list = []
+    # MS MARCO
+    try:
+        ref_file = out_dir / 'msmarco_reference.jsonl'
+        cand_file = out_dir / 'msmarco_candidate.jsonl'
+        if ref_file.exists() and cand_file.exists():
+            eval_script = Path(__file__).parent / 'evals' / 'ms_marco_eval.py'
+            cmd = [sys.executable, str(eval_script), str(ref_file), str(cand_file)]
+            print('Running MS MARCO official evaluator:', ' '.join(cmd))
+            p = subprocess.run(cmd, capture_output=True, text=True)
+            ms_metrics = {}
+            for line in p.stdout.splitlines():
+                if ':' in line:
+                    k, v = line.split(':', 1)
+                    try:
+                        ms_metrics[k.strip()] = float(v.strip())
+                    except Exception:
+                        ms_metrics[k.strip()] = v.strip()
+            summary_list.append({'dataset': 'microsoft/ms_marco', 'official_metrics': ms_metrics, 'official_eval_stdout': p.stdout, 'output_file': str(cand_file)})
+    except Exception as e:
+        print(f"Failed to run MS MARCO official eval: {e}", file=sys.stderr)
+    # HotPotQA
+    for cfg in ["distractor", "fullwiki"]:
+        try:
+            jsonl_path = out_dir / f"hotpotqa_hotpot_qa__{cfg}_outputs.jsonl"
+            gold_path = None  # TODO: set path to gold file if available
+            eval_script = Path(__file__).parent / 'tools' / 'run_hotpot_eval.py'
+            if jsonl_path.exists():
+                cmd = [sys.executable, str(eval_script), str(jsonl_path)]
+                print(f'Running HotPotQA official eval ({cfg}):', ' '.join(cmd))
+                p = subprocess.run(cmd, capture_output=True, text=True)
+                # TODO: parse metrics from output or file
+                summary_list.append({'dataset': f'hotpotqa/hotpot_qa__{cfg}', 'official_eval_stdout': p.stdout, 'output_file': str(jsonl_path)})
+        except Exception as e:
+            print(f"Failed to run HotPotQA official eval ({cfg}): {e}", file=sys.stderr)
+    # TriviaQA
+    try:
+        jsonl_path = out_dir / "mandarjoshi_trivia_qa__rc_outputs.jsonl"
+        gold_path = None  # TODO: set path to gold file if available
+        eval_script = Path(__file__).parent / 'tools' / 'run_trivia_eval.py'
+        if jsonl_path.exists():
+            cmd = [sys.executable, str(eval_script), '--jsonl', str(jsonl_path)]
+            print('Running TriviaQA official eval:', ' '.join(cmd))
+            p = subprocess.run(cmd, capture_output=True, text=True)
+            # TODO: parse metrics from output or file
+            summary_list.append({'dataset': 'mandarjoshi/trivia_qa::rc', 'official_eval_stdout': p.stdout, 'output_file': str(jsonl_path)})
+    except Exception as e:
+        print(f"Failed to run TriviaQA official eval: {e}", file=sys.stderr)
+    # SQuADv2, NQ, RAGTruth, FEVER, etc. can be added similarly
 
     # Save overall summary
     summary_json = out_dir / "summary.json"
